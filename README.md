@@ -1,5 +1,3 @@
-<img src="https://avatars.githubusercontent.com/u/109220009?s=200" alt="logo" width="140" height="140" align="right">
-
 # Gfriends 女友头像仓库
 ![TotalNumber](https://img.shields.io/badge/全部女友数-111,359-blueviolet.svg)  ![AutoUpdate](https://img.shields.io/badge/更新日期-2026--7--11-brightgreen.svg)<br>
 
