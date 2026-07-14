@@ -111,6 +111,14 @@ def split_content_path(path: str) -> tuple[str, str]:
     return parts[1], "/".join(parts[2:])
 
 
+def split_current_image_path(path: Path) -> tuple[str, str]:
+    relative = path.relative_to(CONTENT_DIR)
+    parts = relative.parts
+    if len(parts) < 2:
+        raise ValueError(f"{path} is not under a Content subdirectory")
+    return parts[0], "/".join(parts[1:])
+
+
 def strip_query(value: str) -> str:
     return value.split("?t=", 1)[0]
 
@@ -144,6 +152,23 @@ def current_image_stats() -> tuple[int, int]:
         total_num += 1
         total_size += path.stat().st_size
     return total_num, total_size
+
+
+def current_image_snapshot() -> tuple[dict[str, set[str]], int, int]:
+    images: dict[str, set[str]] = {}
+    total_num = 0
+    total_size = 0
+
+    for path in iter_current_images():
+        total_num += 1
+        total_size += path.stat().st_size
+        try:
+            company, target = split_current_image_path(path)
+        except ValueError:
+            continue
+        images.setdefault(company, set()).add(target)
+
+    return images, total_num, total_size
 
 
 def badge_date(timestamp: object) -> str:
@@ -263,15 +288,124 @@ def update_filetree(changed_paths: set[str]) -> bool:
     return update_readme_badges(data.get("Information", {}))
 
 
+def print_skipped_summary(skipped: list[str], verbose: bool) -> None:
+    if not skipped:
+        return
+
+    print(
+        "Skipped "
+        f"{len(skipped)} image(s) whose natural Filetree key already points "
+        "to another image."
+    )
+    if verbose:
+        for path in skipped:
+            print(f"Skipped {path}: no non-conflicting Filetree key.")
+    else:
+        sample = ", ".join(skipped[:5])
+        print(f"Examples: {sample}")
+        print("Run again with --verbose to print every skipped path.")
+
+
+def sync_full_filetree(refresh_timestamps: bool = False, verbose: bool = False) -> bool:
+    data = load_filetree()
+    content = data["Content"]
+    images, total_num, total_size = current_image_snapshot()
+    run_timestamp = time.time()
+    file_timestamp = int(run_timestamp)
+    next_content: dict[str, dict[str, str]] = {}
+    skipped: list[str] = []
+
+    for company in sorted(images.keys(), reverse=True):
+        targets = images[company]
+        existing_entries = content.get(company, {})
+        next_entries: dict[str, str] = {}
+        covered_targets: set[str] = set()
+
+        for key, value in existing_entries.items():
+            target = strip_query(value)
+            if target not in targets:
+                continue
+
+            covered_targets.add(target)
+            next_value = value
+            if refresh_timestamps or "?t=" not in value:
+                next_value = with_timestamp(target, file_timestamp)
+            next_entries[key] = next_value
+
+        for target in sorted(targets - covered_targets):
+            key = display_key_for_target(next_entries, target)
+            if key is None:
+                skipped.append(f"Content/{company}/{target}")
+                continue
+            next_entries[key] = with_timestamp(target, file_timestamp)
+
+        if next_entries:
+            next_content[company] = next_entries
+
+    old_info = data.get("Information", {})
+    old_total_num = str(old_info.get("TotalNum", ""))
+    old_total_size = str(old_info.get("TotalSize", ""))
+    content_changed = next_content != content
+    info_changed = old_total_num != str(total_num) or old_total_size != str(total_size)
+
+    if content_changed or info_changed or refresh_timestamps:
+        data["Information"] = {
+            "TotalNum": str(total_num),
+            "TotalSize": str(total_size),
+            "Timestamp": run_timestamp,
+        }
+    else:
+        data["Information"] = old_info
+    data["Content"] = next_content
+
+    print_skipped_summary(skipped, verbose)
+
+    rendered = json.dumps(data, ensure_ascii=False, indent=1)
+    existing = FILETREE_PATH.read_text(encoding="utf-8") if FILETREE_PATH.exists() else ""
+    if rendered != existing:
+        FILETREE_PATH.write_text(rendered, encoding="utf-8")
+        print("Updated Filetree.json from local Content scan.")
+        update_readme_badges(data["Information"])
+        return True
+
+    print("Filetree.json is already up to date.")
+    return update_readme_badges(data.get("Information", {}))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Update Filetree.json for changed images.")
+    parser.add_argument(
+        "--all",
+        "--full-scan",
+        action="store_true",
+        dest="full_scan",
+        help="Scan every image under Content for local Filetree.json updates.",
+    )
     parser.add_argument("--changed-from", help="Base git revision for changed files.")
     parser.add_argument("--changed-to", help="Head git revision for changed files.")
+    parser.add_argument(
+        "--refresh-timestamps",
+        action="store_true",
+        help="With --all, refresh every Filetree ?t= cache timestamp.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print every skipped path during a full local scan.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.full_scan:
+        sync_full_filetree(
+            refresh_timestamps=args.refresh_timestamps,
+            verbose=args.verbose,
+        )
+        return 0
+    if args.refresh_timestamps:
+        raise SystemExit("--refresh-timestamps requires --all or --full-scan.")
     changed_paths = changed_paths_from_git(args.changed_from, args.changed_to)
     update_filetree(changed_paths)
     return 0

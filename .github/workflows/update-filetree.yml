@@ -22,14 +22,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           ref: ${{ github.ref_name }}
 
       - name: Update Filetree.json
-        run: |
-          python3 scripts/update_filetree.py \
-            --changed-from "${{ github.event.before }}" \
-            --changed-to "${{ github.sha }}"
+        run: ./scripts/update_filetree_local.sh
 
       - name: Commit generated files
         run: |
