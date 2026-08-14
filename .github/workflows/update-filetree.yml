@@ -25,8 +25,23 @@ jobs:
           fetch-depth: 1
           ref: ${{ github.ref_name }}
 
+      - name: Install image metadata dependency
+        run: python3 -m pip install --disable-pip-version-check Pillow
+
+      - name: Fetch previous commit
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        run: git fetch --no-tags --depth=1 origin "${{ github.event.before }}"
+
       - name: Update Filetree.json
-        run: ./scripts/update_filetree_local.sh
+        if: github.event_name == 'push'
+        run: |
+          ./scripts/update_filetree_local.sh \
+            --changed-from "${{ github.event.before }}" \
+            --changed-to "${{ github.sha }}"
+
+      - name: Full rebuild Filetree.json
+        if: github.event_name == 'workflow_dispatch'
+        run: ./scripts/update_filetree_local.sh --all --refresh-dimensions
 
       - name: Commit generated files
         run: |
@@ -38,5 +53,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Filetree.json README.md
-          git commit -m "AutoUpdate Filetree.json and README badges"
+          git commit -m "AutoUpdate Filetree.json image dimensions and badges"
           git push
