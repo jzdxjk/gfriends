@@ -9,6 +9,15 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import parse_qsl, urlencode
+
+try:
+    from PIL import Image, UnidentifiedImageError
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        "Pillow is required to read image dimensions. Install it with "
+        "'python3 -m pip install Pillow'."
+    ) from exc
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +58,8 @@ def changed_paths_from_git(changed_from: str | None, changed_to: str | None) -> 
                 "--no-commit-id",
                 "--name-status",
                 "--find-renames",
+                "--root",
+                "-z",
                 "-r",
                 changed_to,
                 "--",
@@ -59,6 +70,7 @@ def changed_paths_from_git(changed_from: str | None, changed_to: str | None) -> 
                 "diff",
                 "--name-status",
                 "--find-renames",
+                "-z",
                 changed_from,
                 changed_to,
                 "--",
@@ -70,6 +82,7 @@ def changed_paths_from_git(changed_from: str | None, changed_to: str | None) -> 
             "--cached",
             "--name-status",
             "--find-renames",
+            "-z",
             "--",
             "Content",
         ]
@@ -83,6 +96,8 @@ def changed_paths_from_git(changed_from: str | None, changed_to: str | None) -> 
                 "--no-commit-id",
                 "--name-status",
                 "--find-renames",
+                "--root",
+                "-z",
                 "-r",
                 changed_to or "HEAD",
                 "--",
@@ -91,18 +106,19 @@ def changed_paths_from_git(changed_from: str | None, changed_to: str | None) -> 
         )
 
     paths: set[str] = set()
-    for line in output.splitlines():
-        fields = line.split("\t")
-        if len(fields) < 2:
-            continue
-        status = fields[0]
-        if status.startswith("R") or status.startswith("C"):
-            candidates = fields[1:3]
-        else:
-            candidates = fields[1:2]
-        for candidate in candidates:
+    fields = output.split("\0")
+    field_index = 0
+    while field_index < len(fields):
+        status = fields[field_index]
+        field_index += 1
+        if not status:
+            break
+
+        path_count = 2 if status.startswith(("R", "C")) else 1
+        for candidate in fields[field_index : field_index + path_count]:
             if is_content_image(candidate):
                 paths.add(candidate)
+        field_index += path_count
     return paths
 
 
@@ -120,11 +136,103 @@ def split_current_image_path(path: Path) -> tuple[str, str]:
 
 
 def strip_query(value: str) -> str:
-    return value.split("?t=", 1)[0]
+    return value.partition("?")[0]
 
 
-def with_timestamp(target: str, timestamp: int) -> str:
-    return f"{target}?t={timestamp}"
+def parse_value(value: str) -> tuple[str, dict[str, str]]:
+    target, separator, query = value.partition("?")
+    if not separator:
+        return target, {}
+    return target, dict(parse_qsl(query, keep_blank_values=True))
+
+
+def current_dimensions(value: str) -> tuple[int, int] | None:
+    _, params = parse_value(value)
+    try:
+        width = int(params["w"])
+        height = int(params["h"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def legacy_dimensions(value: str) -> tuple[int, int] | None:
+    """Read the short-lived h=width&l=height format for timestamp migration."""
+    _, params = parse_value(value)
+    try:
+        width = int(params["h"])
+        height = int(params["l"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def has_dimensions(value: str) -> bool:
+    return current_dimensions(value) is not None
+
+
+def has_timestamp(value: str) -> bool:
+    _, params = parse_value(value)
+    try:
+        return int(params["t"]) >= 0
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def timestamp_from_value(value: str, fallback: int) -> int:
+    _, params = parse_value(value)
+    try:
+        return int(params.get("t", fallback))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def get_image_dimensions(path: Path) -> tuple[int, int] | None:
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+            try:
+                orientation = image.getexif().get(274)
+            except (AttributeError, OSError, TypeError, ValueError):
+                orientation = None
+
+            if orientation in {5, 6, 7, 8}:
+                width, height = height, width
+
+            return int(width), int(height)
+    except (
+        Image.DecompressionBombError,
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+    ) as exc:
+        print(f"Warning: failed to read image dimensions: {path}: {exc}")
+        return None
+
+
+def build_filetree_value(target: str, image_path: Path, timestamp: int) -> str:
+    params: list[tuple[str, str]] = []
+    dimensions = get_image_dimensions(image_path)
+    if dimensions is not None:
+        width, height = dimensions
+        params.extend((("w", str(width)), ("h", str(height))))
+    params.append(("t", str(timestamp)))
+    return f"{target}?{urlencode(params)}"
+
+
+def refresh_value_timestamp(value: str, timestamp: int) -> str:
+    target, _ = parse_value(value)
+    ordered_params: list[tuple[str, str]] = []
+    dimensions = current_dimensions(value) or legacy_dimensions(value)
+    if dimensions is not None:
+        width, height = dimensions
+        ordered_params.extend((("w", str(width)), ("h", str(height))))
+    ordered_params.append(("t", str(timestamp)))
+    return f"{target}?{urlencode(ordered_params)}"
 
 
 def load_filetree() -> dict:
@@ -241,7 +349,7 @@ def update_filetree(changed_paths: set[str]) -> bool:
         entries = content.setdefault(company, {})
 
         if target_path.exists():
-            new_value = with_timestamp(target, file_timestamp)
+            new_value = build_filetree_value(target, target_path, file_timestamp)
             touched_existing = False
             for key, value in list(entries.items()):
                 if strip_query(value) == target:
@@ -306,7 +414,11 @@ def print_skipped_summary(skipped: list[str], verbose: bool) -> None:
         print("Run again with --verbose to print every skipped path.")
 
 
-def sync_full_filetree(refresh_timestamps: bool = False, verbose: bool = False) -> bool:
+def sync_full_filetree(
+    refresh_timestamps: bool = False,
+    refresh_dimensions: bool = False,
+    verbose: bool = False,
+) -> bool:
     data = load_filetree()
     content = data["Content"]
     images, total_num, total_size = current_image_snapshot()
@@ -328,8 +440,16 @@ def sync_full_filetree(refresh_timestamps: bool = False, verbose: bool = False) 
 
             covered_targets.add(target)
             next_value = value
-            if refresh_timestamps or "?t=" not in value:
-                next_value = with_timestamp(target, file_timestamp)
+            image_path = CONTENT_DIR / company / target
+            if refresh_dimensions or not has_dimensions(value):
+                timestamp = (
+                    file_timestamp
+                    if refresh_timestamps
+                    else timestamp_from_value(value, file_timestamp)
+                )
+                next_value = build_filetree_value(target, image_path, timestamp)
+            elif refresh_timestamps or not has_timestamp(value):
+                next_value = refresh_value_timestamp(value, file_timestamp)
             next_entries[key] = next_value
 
         for target in sorted(targets - covered_targets):
@@ -337,7 +457,12 @@ def sync_full_filetree(refresh_timestamps: bool = False, verbose: bool = False) 
             if key is None:
                 skipped.append(f"Content/{company}/{target}")
                 continue
-            next_entries[key] = with_timestamp(target, file_timestamp)
+            image_path = CONTENT_DIR / company / target
+            next_entries[key] = build_filetree_value(
+                target,
+                image_path,
+                file_timestamp,
+            )
 
         if next_entries:
             next_content[company] = next_entries
@@ -389,6 +514,11 @@ def parse_args() -> argparse.Namespace:
         help="With --all, refresh every Filetree ?t= cache timestamp.",
     )
     parser.add_argument(
+        "--refresh-dimensions",
+        action="store_true",
+        help="With --all, re-read image dimensions for every image.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print every skipped path during a full local scan.",
@@ -401,11 +531,14 @@ def main() -> int:
     if args.full_scan:
         sync_full_filetree(
             refresh_timestamps=args.refresh_timestamps,
+            refresh_dimensions=args.refresh_dimensions,
             verbose=args.verbose,
         )
         return 0
     if args.refresh_timestamps:
         raise SystemExit("--refresh-timestamps requires --all or --full-scan.")
+    if args.refresh_dimensions:
+        raise SystemExit("--refresh-dimensions requires --all or --full-scan.")
     changed_paths = changed_paths_from_git(args.changed_from, args.changed_to)
     update_filetree(changed_paths)
     return 0
