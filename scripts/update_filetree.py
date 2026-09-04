@@ -114,11 +114,20 @@ def changed_paths_from_git(changed_from: str | None, changed_to: str | None) -> 
         if not status:
             break
 
-        path_count = 2 if status.startswith(("R", "C")) else 1
-        for candidate in fields[field_index : field_index + path_count]:
+        if status.startswith("R"):
+            candidate_paths = fields[field_index : field_index + 2]
+            field_index += 2
+        elif status.startswith("C"):
+            # The source of a copy remains present; only the destination needs
+            # to be added to Filetree and to the incremental totals.
+            candidate_paths = fields[field_index + 1 : field_index + 2]
+            field_index += 2
+        else:
+            candidate_paths = fields[field_index : field_index + 1]
+            field_index += 1
+        for candidate in candidate_paths:
             if is_content_image(candidate):
                 paths.add(candidate)
-        field_index += path_count
     return paths
 
 
@@ -262,6 +271,73 @@ def current_image_stats() -> tuple[int, int]:
     return total_num, total_size
 
 
+def git_blob_size(revision: str | None, path: str) -> int | None:
+    """Return one Git blob size without materializing unrelated Content files."""
+
+    if not revision or is_zero_sha(revision):
+        return None
+    object_spec = f"{revision}:{path}"
+    object_type = subprocess.run(
+        ["git", "cat-file", "-t", object_spec],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if object_type.returncode != 0 or object_type.stdout.strip() != "blob":
+        return None
+    result = subprocess.run(
+        ["git", "cat-file", "-s", object_spec],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def incremental_image_stats(
+    changed_paths: set[str],
+    *,
+    previous_revision: str,
+    current_revision: str,
+    previous_info: dict[str, object],
+) -> tuple[int, int]:
+    """Update totals from changed Git blobs while keeping the checkout sparse."""
+
+    try:
+        total_num = int(previous_info["TotalNum"])
+        total_size = int(previous_info["TotalSize"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Incremental Filetree update requires Information.TotalNum and "
+            "Information.TotalSize; run a full rebuild once."
+        ) from exc
+
+    for path in changed_paths:
+        old_size = git_blob_size(previous_revision, path)
+        new_size = git_blob_size(current_revision, path)
+        if old_size is not None:
+            total_num -= 1
+            total_size -= old_size
+        if new_size is not None:
+            total_num += 1
+            total_size += new_size
+
+    if total_num < 0 or total_size < 0:
+        raise RuntimeError(
+            "Incremental Filetree image totals became negative; run a full rebuild once."
+        )
+    return total_num, total_size
+
+
 def current_image_snapshot() -> tuple[dict[str, set[str]], int, int]:
     images: dict[str, set[str]] = {}
     total_num = 0
@@ -331,7 +407,12 @@ def display_key_for_target(entries: dict[str, str], target: str) -> str | None:
     return None
 
 
-def update_filetree(changed_paths: set[str]) -> bool:
+def update_filetree(
+    changed_paths: set[str],
+    *,
+    previous_revision: str | None = None,
+    current_revision: str | None = None,
+) -> bool:
     data = load_filetree()
 
     if not changed_paths:
@@ -373,7 +454,15 @@ def update_filetree(changed_paths: set[str]) -> bool:
                 del content[company]
 
     if changed:
-        total_num, total_size = current_image_stats()
+        if previous_revision and current_revision:
+            total_num, total_size = incremental_image_stats(
+                changed_paths,
+                previous_revision=previous_revision,
+                current_revision=current_revision,
+                previous_info=data.get("Information", {}),
+            )
+        else:
+            total_num, total_size = current_image_stats()
         data["Information"] = {
             "TotalNum": str(total_num),
             "TotalSize": str(total_size),
@@ -540,7 +629,11 @@ def main() -> int:
     if args.refresh_dimensions:
         raise SystemExit("--refresh-dimensions requires --all or --full-scan.")
     changed_paths = changed_paths_from_git(args.changed_from, args.changed_to)
-    update_filetree(changed_paths)
+    update_filetree(
+        changed_paths,
+        previous_revision=args.changed_from,
+        current_revision=args.changed_to,
+    )
     return 0
 
 

@@ -24,13 +24,42 @@ jobs:
         with:
           fetch-depth: 1
           ref: ${{ github.ref_name }}
+          filter: blob:none
+          sparse-checkout: |
+            /.github/workflows/update-filetree.yml
+            /scripts/update_filetree.py
+            /scripts/update_filetree_local.sh
+            /Filetree.json
+            /README.md
+          sparse-checkout-cone-mode: false
 
       - name: Install image metadata dependency
         run: python3 -m pip install --disable-pip-version-check Pillow
 
       - name: Fetch previous commit
         if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
-        run: git fetch --no-tags --depth=1 origin "${{ github.event.before }}"
+        run: git fetch --no-tags --filter=blob:none --depth=1 origin "${{ github.event.before }}"
+
+      - name: Materialize changed Content images
+        if: github.event_name == 'push'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
+            git diff-tree --no-commit-id --name-only --find-renames --root -z -r \
+              "${AFTER_SHA}" -- Content \
+              | xargs -0 -r git sparse-checkout add --skip-checks
+          else
+            git diff --name-only --find-renames -z \
+              "${BEFORE_SHA}" "${AFTER_SHA}" -- Content \
+              | xargs -0 -r git sparse-checkout add --skip-checks
+          fi
+
+      - name: Materialize full Content for manual rebuild
+        if: github.event_name == 'workflow_dispatch'
+        run: git sparse-checkout disable
 
       - name: Update Filetree.json
         if: github.event_name == 'push'
@@ -55,3 +84,37 @@ jobs:
           git add Filetree.json README.md
           git commit -m "AutoUpdate Filetree.json image dimensions and badges"
           git push
+
+      - name: Publish Filetree Release asset
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_tag='filetree-latest'
+          source_commit="$(git rev-parse HEAD)"
+          checksum_path="Filetree.json.sha256"
+          sha256sum Filetree.json > "${checksum_path}"
+          notes_path="$(mktemp)"
+          trap 'rm -f "${notes_path}"' EXIT
+          {
+            echo 'Gfriends Filetree latest release asset.'
+            echo
+            echo "Filetree-Commit: ${source_commit}"
+            echo "Generated-At: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "${notes_path}"
+
+          if gh release view "${release_tag}" --json id >/dev/null 2>&1; then
+            gh release upload "${release_tag}" Filetree.json "${checksum_path}" --clobber
+            gh release edit "${release_tag}" \
+              --title 'Gfriends Filetree (latest)' \
+              --notes-file "${notes_path}" \
+              --draft=false \
+              --latest=false
+          else
+            gh release create "${release_tag}" Filetree.json "${checksum_path}" \
+              --target "${source_commit}" \
+              --title 'Gfriends Filetree (latest)' \
+              --notes-file "${notes_path}" \
+              --latest=false
+          fi
